@@ -1,0 +1,513 @@
+#!/usr/bin/env python3
+"""
+Pakistani Designer Edit — hourly designer catalogue sync.
+
+Reads each designer's public Shopify feed, keeps the newest in-stock
+ready-to-wear items, converts prices to your store currency with a markup,
+and creates / updates / hides those products in your Shopify store.
+
+Environment variables
+  SHOPIFY_STORE          e.g. dd0xfk-pv.myshopify.com
+  SHOPIFY_CLIENT_ID      } Dev Dashboard app credentials (preferred)
+  SHOPIFY_CLIENT_SECRET  }
+  SHOPIFY_ACCESS_TOKEN   (alternative to client id/secret)
+
+Usage
+  python sync.py                 # normal run
+  python sync.py --dry-run       # read feeds + show what would change, no writes
+  python sync.py --brand maria-b # only one brand
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import os
+import re
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+import requests
+import yaml
+
+API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2026-07")
+ROOT = Path(__file__).resolve().parent
+STATE_PATH = ROOT / "state" / "state.json"
+UA = "Mozilla/5.0 (compatible; PakistaniDesignerEditSync/1.0)"
+FEED_DELAY = 1.0  # seconds between requests to the same designer site
+
+http = requests.Session()
+http.headers["User-Agent"] = UA
+
+
+def log(*a):
+    print(datetime.now().strftime("%H:%M:%S"), *a, flush=True)
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+# ───────────────────────────── designer feeds ─────────────────────────────
+
+def get_json(url, retries=3):
+    for i in range(retries):
+        try:
+            r = http.get(url, timeout=30)
+            if r.status_code == 404:
+                return None
+            if r.status_code in (429, 500, 502, 503, 504):
+                time.sleep(5 * (i + 1))
+                continue
+            r.raise_for_status()
+            return r.json()
+        except (requests.RequestException, ValueError) as e:
+            if i == retries - 1:
+                raise
+            log(f"  retry {url}: {e}")
+            time.sleep(3 * (i + 1))
+    raise RuntimeError(f"giving up on {url}")
+
+
+def _money(v, cents=False):
+    if v in (None, "", 0, "0", "0.00"):
+        return None
+    f = float(v)
+    return f / 100 if cents else f
+
+
+def normalize(raw: dict, from_js: bool = False) -> dict:
+    """Turn a products.json item or a /products/<handle>.js item into one shape."""
+    opts = raw.get("options") or []
+    opt_names = [o["name"] if isinstance(o, dict) else str(o) for o in opts][:3] or ["Title"]
+    tags = raw.get("tags") or []
+    if isinstance(tags, str):
+        tags = [t.strip() for t in tags.split(",") if t.strip()]
+    imgs = []
+    for im in raw.get("images") or []:
+        src = im.get("src") if isinstance(im, dict) else im
+        if src:
+            imgs.append(("https:" + src) if src.startswith("//") else src)
+    variants, seen = [], set()
+    for v in raw.get("variants") or []:
+        values = [v.get(f"option{i}") for i in range(1, len(opt_names) + 1)]
+        values = [str(x) if x is not None else "Default" for x in values]
+        if tuple(values) in seen:
+            continue
+        seen.add(tuple(values))
+        variants.append({
+            "values": values,
+            "price": _money(v.get("price"), from_js) or 0.0,
+            "compare": _money(v.get("compare_at_price"), from_js),
+            "available": bool(v.get("available")),
+            "sku": v.get("sku") or "",
+        })
+    return {
+        "handle": raw["handle"],
+        "title": raw.get("title", "").strip(),
+        "body_html": raw.get("body_html") if not from_js else raw.get("description"),
+        "product_type": (raw.get("product_type") if not from_js else raw.get("type")) or "",
+        "tags": tags,
+        "published_at": raw.get("published_at") or "",
+        "options": opt_names,
+        "variants": variants[:100],
+        "images": imgs[:20],
+    }
+
+
+def is_rtw(p: dict, exclude_re) -> bool:
+    text = " ".join([p["title"], p["product_type"], " ".join(p["tags"])]).lower()
+    return not exclude_re.search(text)
+
+
+def in_stock(p: dict) -> bool:
+    return any(v["available"] for v in p["variants"])
+
+
+def fetch_feed(brand, pages):
+    out = []
+    for page in range(1, pages + 1):
+        data = get_json(f"{brand['url']}/products.json?limit=250&page={page}")
+        items = (data or {}).get("products") or []
+        out.extend(normalize(x) for x in items)
+        time.sleep(FEED_DELAY)
+        if len(items) < 250:
+            break
+    return out
+
+
+def fetch_one(brand, handle):
+    data = get_json(f"{brand['url']}/products/{handle}.js")
+    time.sleep(FEED_DELAY / 2)
+    return normalize(data, from_js=True) if data else None
+
+
+# ───────────────────────────── pricing ─────────────────────────────
+
+class Pricer:
+    def __init__(self, cfg, store_currency):
+        self.cfg = cfg
+        self.store = store_currency
+        self.rates = {}
+
+    def rate(self, src):
+        if src == self.store:
+            return 1.0
+        fixed = self.cfg.get("fixed_rates") or {}
+        if src in fixed:
+            return float(fixed[src])
+        if src not in self.rates:
+            data = get_json(f"https://open.er-api.com/v6/latest/{src}")
+            r = (data or {}).get("rates", {}).get(self.store)
+            if not r:
+                raise RuntimeError(f"No FX rate {src}->{self.store}; add it under pricing.fixed_rates")
+            self.rates[src] = float(r)
+            log(f"FX 1 {src} = {r} {self.store}")
+        return self.rates[src]
+
+    def convert(self, amount, src):
+        if amount is None:
+            return None
+        p = amount * self.rate(src) * (1 + float(self.cfg.get("markup_percent", 0)) / 100)
+        p += float(self.cfg.get("fixed_add", 0))
+        mode = str(self.cfg.get("rounding", "99"))
+        if mode == "99":
+            p = max(math.ceil(p) - 0.01, 0.99)
+        elif mode == "whole":
+            p = math.ceil(p)
+        return f"{p:.2f}"
+
+
+# ───────────────────────────── Shopify ─────────────────────────────
+
+class Shopify:
+    def __init__(self, store, dry_run=False):
+        self.store = store
+        self.dry = dry_run
+        self.url = f"https://{store}/admin/api/{API_VERSION}/graphql.json"
+        self.offline = dry_run and not (os.environ.get("SHOPIFY_ACCESS_TOKEN") or os.environ.get("SHOPIFY_CLIENT_ID"))
+        if not self.offline:
+            self.token = os.environ.get("SHOPIFY_ACCESS_TOKEN") or self._client_credentials()
+
+    def _client_credentials(self):
+        cid, sec = os.environ.get("SHOPIFY_CLIENT_ID"), os.environ.get("SHOPIFY_CLIENT_SECRET")
+        if not (cid and sec):
+            sys.exit("Set SHOPIFY_CLIENT_ID + SHOPIFY_CLIENT_SECRET (or SHOPIFY_ACCESS_TOKEN).")
+        r = requests.post(f"https://{self.store}/admin/oauth/access_token", timeout=30, data={
+            "grant_type": "client_credentials", "client_id": cid, "client_secret": sec})
+        if r.status_code != 200:
+            sys.exit(f"Could not get Shopify token ({r.status_code}): {r.text[:300]}")
+        return r.json()["access_token"]
+
+    def gql(self, query, variables=None):
+        for attempt in range(6):
+            r = requests.post(self.url, timeout=90, json={"query": query, "variables": variables or {}},
+                              headers={"X-Shopify-Access-Token": self.token})
+            if r.status_code in (429, 502, 503, 504):
+                time.sleep(2 ** attempt)
+                continue
+            r.raise_for_status()
+            body = r.json()
+            errs = body.get("errors")
+            if errs:
+                if any((e.get("extensions") or {}).get("code") == "THROTTLED" for e in errs):
+                    time.sleep(2 + attempt * 2)
+                    continue
+                raise RuntimeError(json.dumps(errs)[:800])
+            ts = ((body.get("extensions") or {}).get("cost") or {}).get("throttleStatus") or {}
+            if ts and ts.get("currentlyAvailable", 1000) < 200:
+                time.sleep(2)
+            return body["data"]
+        raise RuntimeError("Shopify API kept throttling")
+
+    def setup(self):
+        if self.offline:  # dry run without credentials
+            self.currency = os.environ.get("STORE_CURRENCY", "GBP")
+            self.location, self.online_store = "gid://shopify/Location/0", None
+            log(f"Offline dry run, assuming store currency {self.currency}")
+            return
+        d = self.gql("""{ shop { currencyCode }
+          locations(first: 10) { nodes { id name isActive } }
+          publications(first: 25) { nodes { id name } } }""")
+        self.currency = d["shop"]["currencyCode"]
+        locs = [l for l in d["locations"]["nodes"] if l["isActive"]]
+        self.location = os.environ.get("SHOPIFY_LOCATION_ID") or locs[0]["id"]
+        pubs = d["publications"]["nodes"]
+        online = [p for p in pubs if p["name"].lower() == "online store"]
+        self.online_store = online[0]["id"] if online else None
+        log(f"Shop currency {self.currency}, location {self.location}, online store pub {self.online_store}")
+
+    PRODUCT_SET = """
+    mutation($input: ProductSetInput!, $identifier: ProductSetIdentifiers) {
+      productSet(input: $input, identifier: $identifier, synchronous: true) {
+        product { id handle variants(first: 250) { nodes { id selectedOptions { name value } } } }
+        userErrors { field message code }
+      }
+    }"""
+
+    def product_set(self, payload, product_id=None):
+        if self.dry:
+            return {"id": product_id or "gid://dry/Product/0", "variants": {"nodes": []}}
+        vars_ = {"input": payload}
+        if product_id:
+            vars_["identifier"] = {"id": product_id}
+        res = self.gql(self.PRODUCT_SET, vars_)["productSet"]
+        if res["userErrors"]:
+            raise RuntimeError(json.dumps(res["userErrors"])[:600])
+        return res["product"]
+
+    def set_status(self, product_id, status):
+        if self.dry:
+            return
+        res = self.gql("""mutation($p: ProductUpdateInput!) {
+          productUpdate(product: $p) { userErrors { message } } }""",
+                       {"p": {"id": product_id, "status": status}})
+        if res["productUpdate"]["userErrors"]:
+            raise RuntimeError(str(res["productUpdate"]["userErrors"]))
+
+    def publish(self, product_id):
+        if self.dry or not self.online_store:
+            return
+        res = self.gql("""mutation($id: ID!, $input: [PublicationInput!]!) {
+          publishablePublish(id: $id, input: $input) { userErrors { message } } }""",
+                       {"id": product_id, "input": [{"publicationId": self.online_store}]})
+        errs = res["publishablePublish"]["userErrors"]
+        if errs:
+            log(f"  publish warning: {errs}")
+
+    def find_by_handle(self, handle):
+        if self.dry:
+            return None
+        d = self.gql("""query($h: String!) { productByIdentifier(identifier: {handle: $h}) {
+            id variants(first: 250) { nodes { id selectedOptions { name value } } } } }""", {"h": handle})
+        return d.get("productByIdentifier")
+
+
+# ───────────────────────────── build payload ─────────────────────────────
+
+def our_handle(brand_key, src_handle):
+    return f"{brand_key}-{src_handle}"[:250]
+
+
+def vkey(values):
+    return "|".join(values)
+
+
+def build_payload(brand, p, pricer, sh, scfg, variant_ids, include_files):
+    status = "ACTIVE" if in_stock(p) or not scfg.get("draft_when_sold_out", True) else "DRAFT"
+    qty = int(scfg.get("stock_qty_when_available", 5))
+    option_values = [[] for _ in p["options"]]
+    for v in p["variants"]:
+        for i, val in enumerate(v["values"]):
+            if val not in option_values[i]:
+                option_values[i].append(val)
+    variants = []
+    for v in p["variants"]:
+        price = pricer.convert(v["price"], brand["currency"])
+        compare = pricer.convert(v["compare"], brand["currency"]) if v["compare"] and v["compare"] > v["price"] else None
+        item = {
+            "optionValues": [{"optionName": n, "name": val} for n, val in zip(p["options"], v["values"])],
+            "price": price,
+            "compareAtPrice": compare,
+            "sku": v["sku"],
+            "inventoryPolicy": "DENY",
+            "inventoryItem": {"tracked": True},
+            "inventoryQuantities": [{"locationId": sh.location, "name": "available",
+                                     "quantity": qty if v["available"] else 0}],
+        }
+        vid = variant_ids.get(vkey(v["values"]))
+        if vid:
+            item["id"] = vid
+        variants.append(item)
+    tags = sorted(set([brand["name"], brand["category"], p["product_type"]] + list(scfg.get("extra_tags") or [])) - {""})
+    payload = {
+        "title": p["title"],
+        "handle": our_handle(brand["key"], p["handle"]),
+        "descriptionHtml": p["body_html"] or "",
+        "vendor": brand["name"],
+        "productType": p["product_type"],
+        "tags": tags,
+        "status": status,
+        "productOptions": [{"name": n, "position": i + 1, "values": [{"name": x} for x in option_values[i]]}
+                           for i, n in enumerate(p["options"])],
+        "variants": variants,
+    }
+    if include_files and p["images"]:
+        payload["files"] = [{"originalSource": u, "contentType": "IMAGE", "alt": p["title"]} for u in p["images"]]
+    return payload
+
+
+def digest(obj):
+    return hashlib.sha1(json.dumps(obj, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def content_hash(payload, img_hash):
+    """Hash of what we'd send, ignoring Shopify ids/files so unchanged products are skipped."""
+    core = {k: v for k, v in payload.items() if k not in ("files", "variants")}
+    core["variants"] = [{k: v for k, v in x.items() if k != "id"} for x in payload["variants"]]
+    core["img"] = img_hash
+    return digest(core)
+
+
+def variant_map(product):
+    m = {}
+    for n in (product.get("variants") or {}).get("nodes", []):
+        m[vkey([o["value"] for o in n["selectedOptions"]])] = n["id"]
+    return m
+
+
+# ───────────────────────────── main sync ─────────────────────────────
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--brand", help="only sync this brand key")
+    args = ap.parse_args()
+
+    cfg = yaml.safe_load((ROOT / "config.yaml").read_text())
+    pcfg, selcfg, scfg = cfg["pricing"], cfg["selection"], cfg["shopify"]
+    kws = [re.escape(k.lower()) for k in selcfg.get("exclude_keywords", [])]
+    exclude_re = re.compile(r"\b(" + "|".join(kws) + r")(s|es)?\b") if kws else re.compile(r"(?!x)x")
+
+    state = json.loads(STATE_PATH.read_text()) if STATE_PATH.exists() else {}
+    state.setdefault("products", {})
+    tracked = state["products"]
+
+    store = os.environ.get("SHOPIFY_STORE", "").replace("https://", "").strip("/")
+    if not store and args.dry_run:
+        store = "dry-run.myshopify.com"
+    if not store:
+        sys.exit("Set SHOPIFY_STORE, e.g. dd0xfk-pv.myshopify.com")
+    sh = Shopify(store, dry_run=args.dry_run)
+    sh.setup()
+    pricer = Pricer(pcfg, sh.currency)
+
+    deadline = time.time() + 60 * float(scfg.get("run_time_budget_minutes", 45))
+    max_new = int(scfg.get("max_new_per_run", 400))
+    stats = {"created": 0, "updated": 0, "unchanged": 0, "hidden": 0, "errors": 0}
+    per_brand = []
+
+    def save():
+        state["last_run"] = now_iso()
+        STATE_PATH.parent.mkdir(exist_ok=True)
+        if not args.dry_run:
+            STATE_PATH.write_text(json.dumps(state, indent=1, sort_keys=True))
+
+    try:
+        for brand in cfg["brands"]:
+            if not brand.get("enabled", True) or (args.brand and brand["key"] != args.brand):
+                continue
+            if time.time() > deadline:
+                log("Time budget reached — continuing next run.")
+                break
+            b = {"brand": brand["name"], "created": 0, "updated": 0, "hidden": 0, "errors": 0}
+            log(f"── {brand['name']}")
+            try:
+                feed = fetch_feed(brand, int(selcfg.get("pages_to_scan", 2)))
+            except Exception as e:  # designer site down: skip this hour
+                log(f"  feed error, skipping: {e}")
+                b["errors"] += 1
+                stats["errors"] += 1
+                per_brand.append(b)
+                continue
+            by_handle = {p["handle"]: p for p in feed}
+            candidates = [p for p in feed if is_rtw(p, exclude_re) and in_stock(p) and p["variants"]]
+            candidates.sort(key=lambda p: p["published_at"], reverse=True)
+            wanted = candidates[: int(selcfg.get("products_per_brand", 150))]
+
+            # products already in your store for this brand that weren't in the scanned pages
+            prefix = brand["key"] + ":"
+            mine = {k[len(prefix):]: v for k, v in tracked.items() if k.startswith(prefix)}
+            work = [(p, False) for p in wanted]
+            wanted_handles = {p["handle"] for p in wanted}
+            for h, rec in mine.items():
+                if h in wanted_handles:
+                    continue
+                if h in by_handle:
+                    work.append((by_handle[h], True))
+                else:
+                    work.append((h, True))  # needs individual lookup
+            log(f"  feed {len(feed)} | RTW in stock {len(candidates)} | syncing {len(wanted)} new-window + {len(work) - len(wanted)} tracked")
+
+            for item, already in work:
+                if time.time() > deadline:
+                    break
+                try:
+                    if isinstance(item, str):
+                        rec = mine[item]
+                        if rec.get("checked") and (time.time() - rec["checked"]) < 6 * 3600:
+                            continue  # older items re-checked every 6h to stay polite
+                        p = fetch_one(brand, item)
+                        rec["checked"] = time.time()
+                        if p is None:  # removed by the designer
+                            if rec.get("status") != "DRAFT":
+                                sh.set_status(rec["id"], "DRAFT")
+                                rec["status"] = "DRAFT"
+                                b["hidden"] += 1
+                            continue
+                    else:
+                        p = item
+                    key = prefix + p["handle"]
+                    rec = tracked.get(key)
+                    if rec is None and stats["created"] >= max_new:
+                        continue
+                    img_hash = digest(p["images"])
+                    vids = (rec or {}).get("variants", {})
+                    include_files = rec is None or rec.get("img") != img_hash
+                    payload = build_payload(brand, p, pricer, sh, scfg, vids, include_files)
+                    h = content_hash(payload, img_hash)
+                    if rec and rec.get("hash") == h:
+                        stats["unchanged"] += 1
+                        continue
+                    pid = (rec or {}).get("id")
+                    if not pid:  # state lost? reuse product if it already exists
+                        existing = sh.find_by_handle(payload["handle"])
+                        if existing:
+                            pid = existing["id"]
+                            payload = build_payload(brand, p, pricer, sh, scfg, variant_map(existing), True)
+                    product = sh.product_set(payload, pid)
+                    is_new = pid is None
+                    if is_new:
+                        sh.publish(product["id"])
+                    if payload["status"] == "DRAFT" and (rec or {}).get("status") != "DRAFT":
+                        b["hidden"] += 1
+                    tracked[key] = {
+                        "id": product["id"], "hash": h, "img": img_hash, "status": payload["status"],
+                        "variants": variant_map(product) or vids, "checked": time.time(),
+                    }
+                    k = "created" if is_new else "updated"
+                    stats[k] += 1
+                    b[k] += 1
+                    if args.dry_run and stats["created"] + stats["updated"] <= 3:
+                        log("  sample payload:", json.dumps(payload)[:700])
+                except Exception as e:
+                    stats["errors"] += 1
+                    b["errors"] += 1
+                    log(f"  error on {item if isinstance(item, str) else item['handle']}: {e}")
+            stats["hidden"] += b["hidden"]
+            per_brand.append(b)
+            log(f"  created {b['created']} updated {b['updated']} hidden {b['hidden']} errors {b['errors']}")
+            save()
+    finally:
+        save()
+
+    log("DONE", json.dumps(stats))
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a") as f:
+            f.write(f"## Designer sync {now_iso()}\n\n")
+            f.write(f"Created **{stats['created']}**, updated **{stats['updated']}**, unchanged {stats['unchanged']}, "
+                    f"hidden {stats['hidden']}, errors {stats['errors']}\n\n")
+            f.write("| Brand | Created | Updated | Hidden | Errors |\n|---|---|---|---|---|\n")
+            for b in per_brand:
+                f.write(f"| {b['brand']} | {b['created']} | {b['updated']} | {b['hidden']} | {b['errors']} |\n")
+    if stats["errors"] and stats["created"] + stats["updated"] + stats["unchanged"] == 0:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+
