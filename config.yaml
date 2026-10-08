@@ -1,0 +1,87 @@
+# ─────────────────────────────────────────────────────────────
+#  Pakistani Designer Edit – designer catalogue sync settings
+#  Edit this file on GitHub; the next hourly run picks it up.
+# ─────────────────────────────────────────────────────────────
+
+pricing:
+  markup_percent: 30          # added on top of the converted source price
+  fixed_add: 0                # flat amount (in YOUR store currency) added after markup, e.g. shipping
+  rounding: "99"              # "99" -> 129.99 | "whole" -> 130 | "none" -> 129.37
+  # Optional manual FX overrides (source -> your store currency). Leave empty to use live rates.
+  # fixed_rates: { PKR: 0.0028, USD: 0.79 }
+  fixed_rates: {}
+
+selection:
+  products_per_brand: 150     # newest in-stock RTW items kept per brand
+  pages_to_scan: 2            # pages of 250 newest products read per brand each hour
+  # Products whose title / type / tags contain any of these words are skipped (not RTW apparel)
+  exclude_keywords:
+    - unstitched
+    - un-stitched
+    - unstiched
+    - fabric
+    - yardage
+    - fragrance
+    - perfume
+    - attar
+    - cosmetic
+    - makeup
+    - lipstick
+    - footwear
+    - shoes
+    - sandal
+    - slides
+    - chappal
+    - khussa
+    - heels
+    - bag
+    - clutch
+    - wallet
+    - jewel
+    - jewellery
+    - jewelry
+    - earring
+    - bangle
+    - gift card
+    - giftcard
+    - home
+    - bedding
+    - bedsheet
+    - cushion
+    - towel
+    - mask
+    - cap
+    - socks
+
+shopify:
+  stock_qty_when_available: 5   # stock shown for an available size
+  draft_when_sold_out: true     # hide a product when every size is sold out at the brand
+  publish_to_online_store: true
+  max_new_per_run: 400          # spreads the first big import over several hourly runs
+  run_time_budget_minutes: 45
+  extra_tags: ["designer-sync"]
+
+brands:
+  - { key: gul-ahmed, name: "Gul Ahmed (Ideas)", category: "Casual", url: "https://www.gulahmedshop.com", currency: PKR, enabled: true }
+  - { key: limelight, name: "Limelight", category: "Casual", url: "https://www.limelight.pk", currency: PKR, enabled: true }
+  - { key: junaid-jamshed, name: "J. (Junaid Jamshed)", category: "Casual", url: "https://www.junaidjamshed.com", currency: PKR, enabled: true }
+  - { key: generation, name: "Generation", category: "Casual", url: "https://generation.com.pk", currency: PKR, enabled: true }
+  - { key: nishat-linen, name: "Nishat Linen", category: "Casual", url: "https://nishatlinen.com", currency: PKR, enabled: true }
+  - { key: beechtree, name: "Beechtree", category: "Casual", url: "https://beechtree.pk", currency: PKR, enabled: true }
+  - { key: zeen, name: "Zeen (by Cambridge)", category: "Casual", url: "https://zeenwoman.com", currency: PKR, enabled: true }
+  - { key: bonanza-satrangi, name: "Bonanza Satrangi", category: "Casual", url: "https://bonanzasatrangi.com", currency: PKR, enabled: true }
+  - { key: sana-safinaz, name: "Sana Safinaz", category: "Luxury Pret", url: "https://sanasafinaz.com", currency: PKR, enabled: true }
+  - { key: zara-shahjahan, name: "Zara Shahjahan", category: "Luxury Pret", url: "https://zarashahjahan.com", currency: PKR, enabled: true }
+  - { key: maria-b, name: "Maria B", category: "Luxury Pret", url: "https://www.mariab.pk", currency: PKR, enabled: true }
+  - { key: elan, name: "Elan", category: "Luxury Pret", url: "https://elan.pk", currency: PKR, enabled: true }
+  - { key: sania-maskatiya, name: "Sania Maskatiya", category: "Luxury Pret", url: "https://saniamaskatiya.com", currency: USD, enabled: true }
+  - { key: agha-noor, name: "Agha Noor", category: "Luxury Pret", url: "https://pk.aghanoorofficial.com", currency: PKR, enabled: true }
+  - { key: saira-shakira, name: "Saira Shakira", category: "Luxury Pret", url: "https://www.sairashakira.com", currency: PKR, enabled: true }
+  - { key: faiza-saqlain, name: "Faiza Saqlain", category: "Luxury Pret", url: "https://www.faizasaqlain.pk", currency: PKR, enabled: true }
+  - { key: misha-lakhani, name: "Misha Lakhani", category: "Luxury Pret", url: "https://www.mishalakhani.com", currency: USD, enabled: true }
+  - { key: sobia-nazir, name: "Sobia Nazir", category: "Luxury Pret", url: "https://sobianazir.net", currency: PKR, enabled: true }
+  - { key: republic-womenswear, name: "Republic Womenswear", category: "Formal Stitched", url: "https://www.republicwomenswear.com", currency: PKR, enabled: true }
+  - { key: suffuse-by-sana-yasir, name: "Suffuse by Sana Yasir", category: "Formal Stitched", url: "https://suffuse.pk", currency: USD, enabled: true }
+  - { key: hussain-rehar, name: "Hussain Rehar", category: "Formal Stitched", url: "https://hussainrehar.com", currency: PKR, enabled: true }
+  - { key: zainab-chottani, name: "Zainab Chottani", category: "Formal Stitched", url: "https://zainabchottani.com", currency: USD, enabled: true }
+  - { key: shiza-hassan, name: "Shiza Hassan", category: "Formal Stitched", url: "https://shizahassan.com", currency: PKR, enabled: true }
