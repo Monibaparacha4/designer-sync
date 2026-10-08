@@ -4,8 +4,8 @@
 # ─────────────────────────────────────────────────────────────
 
 pricing:
-  markup_percent: 30          # added on top of the converted source price
-  fixed_add: 0                # flat amount (in YOUR store currency) added after markup, e.g. shipping
+  markup_percent: 25          # added on top of the converted source price
+  fixed_add: 50                # flat amount (in YOUR store currency) added after markup, e.g. shipping
   rounding: "99"              # "99" -> 129.99 | "whole" -> 130 | "none" -> 129.37
   # Optional manual FX overrides (source -> your store currency). Leave empty to use live rates.
   # fixed_rates: { PKR: 0.0028, USD: 0.79 }
